@@ -2,13 +2,11 @@
 import streamlit as st
 import pandas as pd
 import requests
-import urllib3
 import datetime
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(page_title="A股技术面AI诊断师", page_icon="📈", layout="centered")
 
-# ================= 固定的本地模型列表 =================
+# ================= 模型服务商（模型名称将通过 /models 联网更新） =================
 PRESET_MODELS = {
     "DeepSeek": {"base": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
     "阿里云 Qwen": {"base": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus"},
@@ -16,6 +14,54 @@ PRESET_MODELS = {
     "月之暗面 Kimi": {"base": "https://api.moonshot.cn/v1", "model": "moonshot-v1-8k"},
     "自定义": {"base": "", "model": ""}
 }
+
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+}
+
+
+def normalize_api_base(api_base):
+    """统一 API Base，避免出现 //models 或 //chat/completions。"""
+    return (api_base or "").strip().rstrip("/")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_available_models(api_base, api_key):
+    """从 OpenAI 兼容接口获取模型；失败时由界面回退到默认/手动模式。"""
+    api_base = normalize_api_base(api_base)
+    if not api_base or not api_key:
+        return [], "请先填写 API Key"
+
+    try:
+        response = requests.get(
+            f"{api_base}/models",
+            headers={**REQUEST_HEADERS, "Authorization": f"Bearer {api_key}"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            raw_models = payload.get("data") or []
+        elif isinstance(payload, list):
+            raw_models = payload
+        else:
+            raw_models = []
+        models = sorted(
+            {
+                item.get("id") if isinstance(item, dict) else str(item)
+                for item in raw_models
+                if (isinstance(item, dict) and item.get("id")) or isinstance(item, str)
+            },
+            key=str.lower,
+        )
+        if not models:
+            return [], "接口已连接，但没有返回可用模型"
+        return models, ""
+    except requests.RequestException as exc:
+        return [], f"模型列表更新失败：{exc}"
+    except (TypeError, ValueError) as exc:
+        return [], f"模型列表格式无法识别：{exc}"
 
 # 初始化云端会话状态 (隔离每个用户的访问)
 if "config" not in st.session_state:
@@ -45,16 +91,46 @@ with st.sidebar:
         elif provider == "自定义" and default_base not in [v["base"] for v in PRESET_MODELS.values() if v["base"]]:
             default_provider_index = i
 
-    selected_provider = st.selectbox("选择大模型", provider_options, index=default_provider_index)
+    selected_provider = st.selectbox("选择大模型服务商", provider_options, index=default_provider_index)
     
     if selected_provider == "自定义":
         api_base = st.text_input("API Base URL", value=default_base)
-        model_name = st.text_input("模型名称", value=default_model)
     else:
         api_base = PRESET_MODELS[selected_provider]["base"]
-        model_name = st.text_input("模型名称", value=default_model if default_model and default_provider_index != len(provider_options)-1 else PRESET_MODELS[selected_provider]["model"])
-
     api_key = st.text_input("API Key", type="password", value=default_key)
+
+    api_base = normalize_api_base(api_base)
+    preset_model = PRESET_MODELS[selected_provider]["model"]
+    saved_model = default_model if api_base == normalize_api_base(default_base) else ""
+
+    if selected_provider == "自定义":
+        live_models, model_error = fetch_available_models(api_base, api_key) if api_key else ([], "")
+        if live_models:
+            options = live_models + ([saved_model] if saved_model and saved_model not in live_models else [])
+            initial_model = saved_model if saved_model in options else options[0]
+            model_name = st.selectbox("联网模型列表", options, index=options.index(initial_model))
+            st.caption(f"✅ 已联网获取 {len(live_models)} 个模型（每 5 分钟自动更新）")
+        else:
+            model_name = st.text_input("模型名称", value=saved_model)
+            if model_error:
+                st.caption(f"⚠️ {model_error}，可手动填写模型名称。")
+    else:
+        live_models, model_error = fetch_available_models(api_base, api_key) if api_key else ([], "")
+        if live_models:
+            options = live_models + ([saved_model] if saved_model and saved_model not in live_models else [])
+            preferred_model = saved_model if saved_model in options else preset_model
+            initial_model = preferred_model if preferred_model in options else options[0]
+            model_name = st.selectbox("选择模型（联网更新）", options, index=options.index(initial_model))
+            st.caption(f"✅ 已获取 {len(live_models)} 个最新可用模型（缓存 5 分钟）")
+        else:
+            fallback_model = saved_model or preset_model
+            model_name = st.text_input("模型名称（接口不可用时可手动修改）", value=fallback_model)
+            if api_key and model_error:
+                st.caption(f"⚠️ {model_error}")
+
+    if st.button("🔄 立即刷新模型列表", use_container_width=True):
+        fetch_available_models.clear()
+        st.rerun()
     
     if st.button("💾 保存当前配置", use_container_width=True):
         st.session_state.config = {"api_key": api_key, "api_base": api_base, "model_name": model_name}
@@ -80,27 +156,51 @@ with st.sidebar:
             st.rerun()
 
 # ================= 核心功能与数据获取 =================
-@st.cache_data(ttl=60) 
+@st.cache_data(ttl=15, show_spinner=False)
 def fetch_market_indices():
-    indices = {"上证指数": "1.000001", "深证成指": "0.399001", "创业板指": "0.399006"}
-    results = {}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    proxies = {"http": None, "https": None}
-    
-    for name, secid in indices.items():
-        url = f"http://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116&klt=101&fqt=1&end=20500101&lmt=1"
-        try:
-            response = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=5)
-            data = response.json()
-            klines = data.get("data", {}).get("klines", [])
-            if klines:
-                latest = klines[0].split(',')
-                results[name] = {"close": float(latest[2]), "pct_chg": float(latest[8])}
-        except Exception:
-            results[name] = {"close": 0.0, "pct_chg": 0.0}
-    return results
+    """获取实时指数快照，盘中为最新价、收盘后为最新收盘价。"""
+    secids = "1.000001,0.399001,0.399006"
+    url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+    params = {
+        "fltt": "2",
+        "invt": "2",
+        "fields": "f12,f14,f2,f3,f4,f18,f124",
+        "secids": secids,
+    }
+    try:
+        response = requests.get(url, params=params, headers=REQUEST_HEADERS, timeout=8)
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") or {} if isinstance(payload, dict) else {}
+        rows = data.get("diff") or []
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        results = {}
+        for row in rows:
+            name = row.get("f14")
+            price = row.get("f2")
+            pct_chg = row.get("f3")
+            if name and isinstance(price, (int, float)):
+                quote_time = row.get("f124")
+                if quote_time:
+                    updated_at = datetime.datetime.fromtimestamp(
+                        quote_time, tz=datetime.timezone(datetime.timedelta(hours=8))
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    updated_at = datetime.datetime.now(
+                        datetime.timezone(datetime.timedelta(hours=8))
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                results[name] = {
+                    "close": float(price),
+                    "pct_chg": float(pct_chg or 0),
+                    "change": float(row.get("f4") or 0),
+                    "updated_at": updated_at,
+                }
+        return results, ""
+    except (requests.RequestException, TypeError, ValueError) as exc:
+        return {}, f"实时指数获取失败：{exc}"
 
-@st.cache_data(ttl=3600)  
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_stock_data(symbol):
     try:
         if symbol in ["上证指数", "sh000001", "999999"]: secid = "1.000001"
@@ -108,11 +208,9 @@ def fetch_stock_data(symbol):
         elif symbol in ["创业板指", "sz399006", "399006"]: secid = "0.399006"
         else: secid = f"1.{symbol}" if symbol.startswith(('6', '5')) else f"0.{symbol}"
             
-        url = f"http://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116&klt=101&fqt=1&end=20500101&lmt=100"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        proxies = {"http": None, "https": None}
+        url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116&klt=101&fqt=1&end=20500101&lmt=100"
         
-        response = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=15)
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=15)
         if response.status_code != 200: return None
             
         data = response.json()
@@ -170,7 +268,7 @@ def generate_ai_diagnosis(data, symbol, api_key, api_base, model_name):
     payload = {"model": model_name, "messages": [{"role": "system", "content": "你是专业金融AI助手。"}, {"role": "user", "content": prompt}], "temperature": 0.2}
     
     try:
-        response = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=30)
+        response = requests.post(f"{normalize_api_base(api_base)}/chat/completions", headers=headers, json=payload, timeout=30)
         if response.status_code == 200: return response.json()['choices'][0]['message']['content']
         else: return f"API请求失败: {response.status_code} - {response.text}"
     except Exception as e:
@@ -180,13 +278,21 @@ def generate_ai_diagnosis(data, symbol, api_key, api_base, model_name):
 st.title("🤖 A股技术面 AI 诊断师")
 
 with st.container():
-    market_data = fetch_market_indices()
+    market_data, market_error = fetch_market_indices()
     if market_data:
         m_cols = st.columns(3)
         for col, (name, data) in zip(m_cols, market_data.items()):
-            col.metric(name, f"{data['close']:.2f}", f"{data['pct_chg']}%", delta_color="inverse")
+            col.metric(name, f"{data['close']:.2f}", f"{data['pct_chg']:+.2f}%", delta_color="inverse")
             if col.button(f"🤖 诊断{name}", key=f"btn_{name}", use_container_width=True):
                 st.session_state.trigger_analysis = name
+        latest_quote_time = max(item["updated_at"] for item in market_data.values())
+        st.caption(f"行情更新时间（北京时间）：{latest_quote_time} · 页面加载自动获取，数据缓存 15 秒")
+    elif market_error:
+        st.warning(market_error)
+
+    if st.button("🔄 刷新指数行情", use_container_width=True):
+        fetch_market_indices.clear()
+        st.rerun()
     st.markdown("---")
 
 st.markdown("输入股票代码，或点击上方按钮一键诊断大盘。")
